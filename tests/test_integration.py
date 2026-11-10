@@ -260,5 +260,7 @@ class TestEdgeCases:
             # Should handle special characters properly
             assert len(result) == 1
             text = result[0].text
-            assert 'Hello, "World"' in text
+            # Values with commas/quotes/newlines are CSV-quoted so rows stay parseable
+            assert '"Hello, ""World"""' in text
+            assert '"Line1\nLine2"' in text
             assert 'None' in text  # None should be converted to string

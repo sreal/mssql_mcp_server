@@ -1,8 +1,12 @@
 import asyncio
 import contextlib
+import csv
+import io
 import logging
 import os
 import re
+import shlex
+from typing import Any
 
 import pymssql
 from mcp.server import Server
@@ -54,15 +58,49 @@ def validate_table_name(table_name: str) -> str:
         # Just table name
         return f"[{table_name}]"
 
-def allow_writes() -> bool:
-    """Whether non-SELECT statements are permitted (default: read-only)."""
-    return os.getenv("MSSQL_ALLOW_WRITES", "false").lower() in ("1", "true", "yes")
+def _is_true(value) -> bool:
+    return str(value).lower() in ("1", "true", "yes")
 
-def get_db_config():
-    """Get database configuration from environment variables."""
+def get_targets() -> list[str]:
+    """Named database targets from MSSQL_TARGETS (e.g. "australia,synapse").
+
+    Empty means single-target mode: one database from the plain MSSQL_* variables.
+    With targets, each one reads MSSQL_<TARGET>_SERVER, _DATABASE, _USER, _PASSWORD, etc.
+    and the query tool takes a required ``server`` argument naming the target.
+    """
+    targets = []
+    for name in os.getenv("MSSQL_TARGETS", "").split(","):
+        name = name.strip().lower()
+        if not name:
+            continue
+        if not re.match(r"^[a-z0-9_]+$", name):
+            raise ValueError(f"Invalid target name in MSSQL_TARGETS: {name!r} (use a-z, 0-9, _)")
+        targets.append(name)
+    return targets
+
+def _env_prefix(target: str | None) -> str:
+    return "MSSQL_" if target is None else f"MSSQL_{target.upper()}_"
+
+def allow_writes(target: str | None = None) -> bool:
+    """Whether non-SELECT statements are permitted (default: read-only).
+
+    MSSQL_ALLOW_WRITES enables writes everywhere; MSSQL_<TARGET>_ALLOW_WRITES enables one target.
+    """
+    if _is_true(os.getenv("MSSQL_ALLOW_WRITES", "false")):
+        return True
+    return target is not None and _is_true(os.getenv(f"{_env_prefix(target)}ALLOW_WRITES", "false"))
+
+def any_writes() -> bool:
+    """Whether writes are enabled for at least one target (decides the tool name and hints)."""
+    return allow_writes() or any(allow_writes(t) for t in get_targets())
+
+def get_db_config(target: str | None = None):
+    """Get database configuration from environment variables (MSSQL_* or MSSQL_<TARGET>_*)."""
+    prefix = _env_prefix(target)
+    label = target or "default"
     # Basic configuration
-    server = os.getenv("MSSQL_SERVER", "localhost")
-    logger.info(f"MSSQL_SERVER environment variable: {os.getenv('MSSQL_SERVER', 'NOT SET')}")
+    server = os.getenv(prefix + "SERVER", "localhost")
+    logger.info(f"[{label}] {prefix}SERVER environment variable: {os.getenv(prefix + 'SERVER', 'NOT SET')}")
     logger.info(f"Using server: {server}")
     
     # Handle LocalDB connections (Issue #6)
@@ -74,14 +112,14 @@ def get_db_config():
         server = f".\\{instance_name}"
         logger.info(f"Detected LocalDB connection, converted to: {server}")
     
-    config = {
+    config: dict[str, Any] = {
         "server": server,
-        "user": os.getenv("MSSQL_USER"),
-        "password": os.getenv("MSSQL_PASSWORD"),
-        "database": os.getenv("MSSQL_DATABASE"),
+        "user": os.getenv(prefix + "USER"),
+        "password": os.getenv(prefix + "PASSWORD"),
+        "database": os.getenv(prefix + "DATABASE"),
     }
     # Port support (Issue #8) — only set when explicitly configured
-    port = os.getenv("MSSQL_PORT")
+    port = os.getenv(prefix + "PORT")
     if port:
         try:
             config["port"] = int(port)
@@ -94,11 +132,11 @@ def get_db_config():
     if config["server"] and ".database.windows.net" in config["server"]:
         config["tds_version"] = "7.4"  # Required for Azure SQL
         # Azure SQL requires encryption
-        if os.getenv("MSSQL_ENCRYPT", "true").lower() == "true":
+        if os.getenv(prefix + "ENCRYPT", "true").lower() == "true":
             config["encryption"] = "require"
     else:
         # For non-Azure connections, respect the MSSQL_ENCRYPT setting
-        encrypt_str = os.getenv("MSSQL_ENCRYPT", "false")
+        encrypt_str = os.getenv(prefix + "ENCRYPT", "false")
         if encrypt_str.lower() == "true":
             config["encryption"] = "require"
         else:
@@ -107,26 +145,26 @@ def get_db_config():
     # Trust server certificate (Issue #39)
     # FreeTDS/pymssql do not expose a first-class kwarg; when requested we append
     # the ODBC-style option that many FreeTDS builds honor on the server string.
-    trust_env = os.getenv("MSSQL_TRUST_SERVER_CERTIFICATE")
-    if trust_env is None and config.get("encryption") == "require":
-        # Sensible defaults: Azure validates certs; on-prem encrypt often needs trust
-        if config["server"] and ".database.windows.net" in str(config["server"]).split(";")[0]:
-            trust_env = "false"
-        else:
-            trust_env = "true"
+    trust_env = os.getenv(prefix + "TRUST_SERVER_CERTIFICATE")
+    is_azure = bool(config["server"]) and ".database.windows.net" in str(config["server"]).split(";")[0]
+    if trust_env is None and config.get("encryption") == "require" and not is_azure:
+        # On-prem encrypt often needs trust. Azure gets no suffix: its certs are valid,
+        # and FreeTDS treats "host;TrustServerCertificate=no" as the host name, so the
+        # connection fails ("failed for an unknown reason").
+        trust_env = "true"
     if trust_env is not None:
         flag = "yes" if trust_env.lower() in ("1", "true", "yes") else "no"
         base_server = str(config["server"]).split(";")[0]
         config["server"] = f"{base_server};TrustServerCertificate={flag}"
             
     # Windows Authentication support (Issue #7)
-    use_windows_auth = os.getenv("MSSQL_WINDOWS_AUTH", "false").lower() == "true"
+    use_windows_auth = os.getenv(prefix + "WINDOWS_AUTH", "false").lower() == "true"
     
     if use_windows_auth:
         # For Windows authentication, user and password are not required
         if not config["database"]:
-            logger.error("MSSQL_DATABASE is required")
-            raise ValueError("Missing required database configuration")
+            logger.error(f"{prefix}DATABASE is required")
+            raise ValueError(f"Missing required database configuration for {label}")
         # Remove user and password for Windows auth
         config.pop("user", None)
         config.pop("password", None)
@@ -135,27 +173,42 @@ def get_db_config():
         # SQL Authentication - user and password are required
         if not all([config["user"], config["password"], config["database"]]):
             logger.error("Missing required database configuration. Please check environment variables:")
-            logger.error("MSSQL_USER, MSSQL_PASSWORD, and MSSQL_DATABASE are required")
-            raise ValueError("Missing required database configuration")
+            logger.error(f"{prefix}USER, {prefix}PASSWORD, and {prefix}DATABASE are required")
+            raise ValueError(f"Missing required database configuration for {label}")
 
     # Query timeout support (Issue #40 / PR #41)
     try:
-        config["timeout"] = int(os.getenv("MSSQL_QUERY_TIMEOUT", "300"))
+        config["timeout"] = int(os.getenv(prefix + "QUERY_TIMEOUT", "300"))
     except ValueError:
         logger.warning("Invalid MSSQL_QUERY_TIMEOUT; using default 300 seconds")
         config["timeout"] = 300
+
+    # Session SET options run on connect. pymssql's default batch is rejected by
+    # Azure Synapse ("Could not set connection properties"), so allow overriding it.
+    conn_properties = os.getenv(prefix + "CONN_PROPERTIES")
+    if conn_properties is not None:
+        config["conn_properties"] = conn_properties
 
     # Safety net: never pass unsupported `encrypt` kwarg to pymssql (PR #38 / issues #33/#34)
     config.pop("encrypt", None)
     
     return config
 
+def format_rows(columns, rows) -> str:
+    """Render a result set as CSV. Values with commas, quotes or newlines are quoted."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(columns)
+    for row in rows:
+        writer.writerow([str(value) for value in row])
+    return buffer.getvalue().rstrip("\n")
+
 def get_command():
     """Get the MCP tool name (query for read-only, execute_sql for write mode)."""
     override = os.getenv("MSSQL_COMMAND")
     if override:
         return override
-    return "execute_sql" if allow_writes() else "query"
+    return "execute_sql" if any_writes() else "query"
 
 # Statement roots permitted in read-only mode (fail-closed otherwise).
 _READ_ONLY_ROOTS = (
@@ -252,7 +305,9 @@ app = Server("mssql_mcp_server")
 
 @app.list_resources()
 async def list_resources() -> list[Resource]:
-    """List SQL Server tables as resources."""
+    """List SQL Server tables as resources (single-target mode only)."""
+    if get_targets():
+        return []
     config = get_db_config()
     conn = None
     cursor = None
@@ -293,6 +348,8 @@ async def list_resources() -> list[Resource]:
 @app.read_resource()
 async def read_resource(uri: AnyUrl) -> str:
     """Read table contents."""
+    if get_targets():
+        raise ValueError("Resources are not available when MSSQL_TARGETS is set; use the query tool")
     config = get_db_config()
     uri_str = str(uri)
     logger.info(f"Reading resource: {uri_str}")
@@ -315,10 +372,9 @@ async def read_resource(uri: AnyUrl) -> str:
             raise RuntimeError("Query did not return a result set")
         columns = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
-        result = [",".join(map(str, row)) for row in rows]
         cursor.close()
         conn.close()
-        return "\n".join([",".join(columns)] + result)
+        return format_rows(columns, rows)
                 
     except pymssql.OperationalError as e:
         if "timed out" in str(e).lower():
@@ -336,13 +392,68 @@ async def read_resource(uri: AnyUrl) -> str:
         logger.error(f"Database error reading resource {uri}: {e!s}")
         raise RuntimeError(f"Database error: {e!s}") from e
 
+LIVE_DATABASE_WARNING = (
+    "Writes run against the live database: show the user the exact statement and get "
+    "their confirmation before running it."
+)
+
+def write_enable_command(target: str | None = None) -> str:
+    """The shell command that restarts the client with writes allowed on target (all if None).
+
+    MSSQL_RESTART_COMMAND is how the user starts their MCP client (default: "claude --continue").
+    The write switch is read from the environment, so it only changes when the client restarts.
+    MSSQL_RESTART_DIR, when set, is prepended as "cd <dir> &&" (resuming a session needs its directory).
+    """
+    restart = os.getenv("MSSQL_RESTART_COMMAND", "").strip() or "claude --continue"
+    command = f"{_env_prefix(target)}ALLOW_WRITES=1 {restart}"
+    restart_dir = os.getenv("MSSQL_RESTART_DIR", "").strip()
+    if restart_dir:
+        command = f"cd {shlex.quote(restart_dir)} && {command}"
+    return command
+
+def write_enable_hint(target: str | None = None) -> str:
+    """Tell the user how to allow writes; used when a server is read-only."""
+    where = f" on {target}" if target else ""
+    return (
+        f"To allow writes{where}, the user must exit and restart with: "
+        f"`{write_enable_command(target)}`. {LIVE_DATABASE_WARNING}"
+    )
+
+def _tool_description(targets: list[str]) -> str:
+    if not targets:
+        if allow_writes():
+            return f"Execute an SQL query on the SQL Server. WARNING: writes are enabled. {LIVE_DATABASE_WARNING}"
+        return f"Run a read-only SQL query (SELECT only). {write_enable_hint()}"
+    parts = [f"Run an SQL query on one of these SQL Servers: {', '.join(targets)}."]
+    writable = [t for t in targets if allow_writes(t)]
+    read_only = [t for t in targets if not allow_writes(t)]
+    if writable:
+        parts.append(f"WARNING: writes are enabled on: {', '.join(writable)}. {LIVE_DATABASE_WARNING}")
+    if read_only:
+        parts.append(
+            f"Read-only (SELECT only) on: {', '.join(read_only)}. If the user needs a write there, "
+            f"tell them to exit and restart with `{write_enable_command('<server>')}` "
+            f"(MSSQL_ALLOW_WRITES=1 instead allows writes on every server)."
+        )
+    return " ".join(parts)
+
+def _server_property(targets: list[str]) -> dict:
+    if not targets:
+        return {}
+    return {"server": {
+        "type": "string",
+        "enum": targets,
+        "description": "Which configured SQL Server to run the query on.",
+    }}
+
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     """List available SQL Server tools."""
     command = get_command()
+    targets = get_targets()
     logger.info("Listing tools...")
     annotations = None
-    if not allow_writes():
+    if not any_writes():
         annotations = ToolAnnotations(
             readOnlyHint=True,
             destructiveHint=False,
@@ -352,20 +463,25 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name=command,
-            description=(
-                "Execute an SQL query on the SQL Server"
-                if allow_writes()
-                else "Run a read-only SQL query"
-            ),
+            description=_tool_description(targets),
             inputSchema={
                 "type": "object",
                 "properties": {
+                    **_server_property(targets),
                     "query": {
                         "type": "string",
                         "description": "The SQL query to execute"
-                    }
+                    },
+                    "database": {
+                        "type": "string",
+                        "description": (
+                            "Optional database to run the query in. Defaults to the "
+                            "configured MSSQL_DATABASE. Use this instead of three-part "
+                            "names, which Azure SQL Database does not support."
+                        ),
+                    },
                 },
-                "required": ["query"]
+                "required": (["server", "query"] if targets else ["query"])
             },
             annotations=annotations,
         )
@@ -384,16 +500,30 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("Query is required")
 
-    if not allow_writes() and not is_select_query(query):
+    target = None
+    targets = get_targets()
+    if targets:
+        target = arguments.get("server")
+        if target not in targets:
+            raise ValueError(f"server must be one of: {', '.join(targets)} (got {target!r})")
+
+    if not allow_writes(target) and not is_select_query(query):
+        read_only_name = f"{target} is in read-only mode" if target else "This server is in read-only mode"
         return [TextContent(
             type="text",
             text=(
-                "Error: only SELECT queries are allowed in read-only mode. "
-                "Set MSSQL_ALLOW_WRITES=1 to enable writes (Agent mode)."
+                f"Error: {read_only_name}: only SELECT queries are allowed. Nothing was run. "
+                + write_enable_hint(target)
             ),
         )]
 
-    config = get_db_config()
+    config = get_db_config(target)
+    database = arguments.get("database")
+    if database is not None:
+        if not isinstance(database, str) or not database.strip():
+            raise ValueError("database must be a non-empty string when given")
+        config["database"] = database.strip()
+
     conn = None
     cursor = None
     try:
@@ -401,21 +531,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         cursor = conn.cursor()
         cursor.execute(query)
         
-        # Special handling for table listing
-        if is_select_query(query) and "INFORMATION_SCHEMA.TABLES" in query.upper():
-            tables = cursor.fetchall()
-            result = ["Tables_in_" + config["database"]]  # Header
-            result.extend([table[0] for table in tables])
-            return [TextContent(type="text", text="\n".join(result))]
-        
-        # Regular SELECT queries
-        elif is_select_query(query):
+        # SELECT queries return every column. (Upstream special-cased INFORMATION_SCHEMA.TABLES
+        # and returned only the first column, which silently dropped data.)
+        if is_select_query(query):
             if cursor.description is None:
                 raise RuntimeError("Query did not return a result set")
             columns = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
-            result = [",".join(map(str, row)) for row in rows]
-            return [TextContent(type="text", text="\n".join([",".join(columns)] + result))]
+            return [TextContent(type="text", text=format_rows(columns, rows))]
         
         # Non-SELECT queries
         else:
@@ -427,7 +550,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if "timed out" in str(e).lower():
             logger.error(
                 "Query timed out after %s seconds: %s",
-                os.getenv("MSSQL_QUERY_TIMEOUT", "300"),
+                config.get("timeout"),
                 query[:200],
             )
             return [TextContent(
@@ -452,14 +575,15 @@ async def main():
     from mcp.server.stdio import stdio_server
     
     logger.info("Starting MSSQL MCP server...")
-    config = get_db_config()
-    # Log connection info without exposing sensitive data
-    server_info = str(config['server']).split(';')[0]
-    if 'port' in config:
-        server_info += f":{config['port']}"
-    user_info = config.get('user', 'Windows Auth')
-    logger.info(f"Database config: {server_info}/{config['database']} as {user_info}")
-    logger.info("Write mode: %s", "enabled" if allow_writes() else "read-only")
+    # Fail fast if any target is misconfigured. Log without exposing sensitive data.
+    for target in (get_targets() or [None]):
+        config = get_db_config(target)
+        server_info = str(config['server']).split(';')[0]
+        if 'port' in config:
+            server_info += f":{config['port']}"
+        user_info = config.get('user', 'Windows Auth')
+        logger.info(f"[{target or 'default'}] Database config: {server_info}/{config['database']} as {user_info}")
+        logger.info("[%s] Write mode: %s", target or "default", "enabled" if allow_writes(target) else "read-only")
     
     async with stdio_server() as (read_stream, write_stream):
         try:

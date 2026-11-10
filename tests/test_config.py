@@ -62,8 +62,8 @@ class TestDatabaseConfiguration:
             config = get_db_config()
             assert config['encryption'] == 'require'
             assert config['tds_version'] == '7.4'
-            assert config['server'].startswith('myserver.database.windows.net')
-            assert 'TrustServerCertificate=no' in config['server']
+            # Regression: a ";TrustServerCertificate=no" suffix breaks FreeTDS connections to Azure.
+            assert config['server'] == 'myserver.database.windows.net'
             assert config['timeout'] == 300
             assert 'encrypt' not in config
     
