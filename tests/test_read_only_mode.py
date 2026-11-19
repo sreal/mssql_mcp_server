@@ -183,3 +183,66 @@ class TestCallToolReadOnlyGate:
             result = await call_tool("execute_sql", {"query": "INSERT INTO t VALUES (1)"})
             assert "Rows affected: 1" in result[0].text
             mock_connect.assert_called_once()
+
+    async def test_write_mode_returns_the_last_result_set_of_a_script(self):
+        env = {
+            "MSSQL_ALLOW_WRITES": "1",
+            "MSSQL_USER": "u",
+            "MSSQL_PASSWORD": "p",
+            "MSSQL_DATABASE": "db",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("mssql_mcp_server.server.pymssql.connect") as mock_connect,
+        ):
+            # Two result sets: an early one, then the final PASS/FAIL table.
+            sets = [
+                ([("n",)], [(1,)]),
+                ([("check",), ("result",)], [("P1", "PASS"), ("P2", "FAIL")]),
+            ]
+            state = {"i": 0}
+            mock_cursor = MagicMock()
+            mock_cursor.rowcount = 85
+            type(mock_cursor).description = property(lambda self: sets[state["i"]][0])
+            mock_cursor.fetchall.side_effect = lambda: sets[state["i"]][1]
+
+            def nextset():
+                if state["i"] + 1 < len(sets):
+                    state["i"] += 1
+                    return True
+                return None
+
+            mock_cursor.nextset.side_effect = nextset
+            mock_conn = MagicMock()
+            mock_conn.cursor.return_value = mock_cursor
+            mock_connect.return_value = mock_conn
+
+            result = await call_tool("execute_sql", {"query": "DECLARE @x int = 1; INSERT INTO t VALUES (@x); SELECT 'P1' AS [check];"})
+            text = result[0].text
+            assert text.startswith("Query executed successfully. Rows affected: 85")
+            assert text.endswith("check,result\nP1,PASS\nP2,FAIL")
+            assert "n\n1" not in text
+            mock_conn.commit.assert_called_once()
+
+    async def test_write_mode_without_a_result_set_returns_only_the_count(self):
+        env = {
+            "MSSQL_ALLOW_WRITES": "1",
+            "MSSQL_USER": "u",
+            "MSSQL_PASSWORD": "p",
+            "MSSQL_DATABASE": "db",
+        }
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("mssql_mcp_server.server.pymssql.connect") as mock_connect,
+        ):
+            mock_cursor = MagicMock()
+            mock_cursor.rowcount = 3
+            mock_cursor.description = None
+            mock_cursor.nextset.return_value = None
+            mock_conn = MagicMock()
+            mock_conn.cursor.return_value = mock_cursor
+            mock_connect.return_value = mock_conn
+
+            result = await call_tool("execute_sql", {"query": "DELETE FROM t WHERE id < 4"})
+            assert result[0].text == "Query executed successfully. Rows affected: 3"
+            mock_conn.commit.assert_called_once()

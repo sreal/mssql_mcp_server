@@ -184,6 +184,21 @@ async def test_blocked_write_names_the_command_and_warns():
     assert "live database" in text
 
 
+@pytest.mark.asyncio
+async def test_blocked_write_asks_claude_to_show_the_command_on_its_own_line():
+    env = {**TWO_TARGETS, "MSSQL_RESTART_COMMAND": "cw --continue"}
+    with patch.dict(os.environ, env, clear=True), \
+         patch("mssql_mcp_server.server.pymssql.connect"):
+        result = await call_tool("query", {"server": "beta", "query": "UPDATE dbo.t SET x = 1"})
+    lines = result[0].text.split("\n")
+    assert lines[0].endswith(
+        "Writes are off on beta. Show the user this command exactly, on its own line, "
+        "and ask them to run it if they want writes:"
+    )
+    assert lines[1] == "`MSSQL_BETA_ALLOW_WRITES=1 cw --continue`"
+    assert lines[2].startswith("Writes run against the live database")
+
+
 def test_restart_command_defaults_to_claude_continue():
     with patch.dict(os.environ, TWO_TARGETS, clear=True):
         assert write_enable_command("beta") == "MSSQL_BETA_ALLOW_WRITES=1 claude --continue"

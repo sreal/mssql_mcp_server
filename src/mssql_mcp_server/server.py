@@ -415,8 +415,10 @@ def write_enable_hint(target: str | None = None) -> str:
     """Tell the user how to allow writes; used when a server is read-only."""
     where = f" on {target}" if target else ""
     return (
-        f"To allow writes{where}, the user must exit and restart with: "
-        f"`{write_enable_command(target)}`. {LIVE_DATABASE_WARNING}"
+        f"Writes are off{where}. Show the user this command exactly, on its own line, "
+        f"and ask them to run it if they want writes:\n"
+        f"`{write_enable_command(target)}`\n"
+        f"{LIVE_DATABASE_WARNING}"
     )
 
 def _tool_description(targets: list[str]) -> str:
@@ -432,7 +434,8 @@ def _tool_description(targets: list[str]) -> str:
     if read_only:
         parts.append(
             f"Read-only (SELECT only) on: {', '.join(read_only)}. If the user needs a write there, "
-            f"tell them to exit and restart with `{write_enable_command('<server>')}` "
+            f"show the user this command exactly, on its own line, and ask them to run it: "
+            f"`{write_enable_command('<server>')}` "
             f"(MSSQL_ALLOW_WRITES=1 instead allows writes on every server)."
         )
     return " ".join(parts)
@@ -542,9 +545,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         
         # Non-SELECT queries
         else:
-            conn.commit()
             affected_rows = cursor.rowcount
-            return [TextContent(type="text", text=f"Query executed successfully. Rows affected: {affected_rows}")]
+            # A script can end with a result table (for example a PASS/FAIL check). Walk every
+            # result set and keep the last one that has columns, so the caller still sees it.
+            last_columns = None
+            last_rows = None
+            while True:
+                description = cursor.description
+                if isinstance(description, (list, tuple)) and description:
+                    last_columns = [desc[0] for desc in description]
+                    last_rows = cursor.fetchall()
+                if cursor.nextset() is not True:
+                    break
+            conn.commit()
+            text = f"Query executed successfully. Rows affected: {affected_rows}"
+            if last_columns is not None:
+                text += "\n" + format_rows(last_columns, last_rows)
+            return [TextContent(type="text", text=text)]
 
     except pymssql.OperationalError as e:
         if "timed out" in str(e).lower():
