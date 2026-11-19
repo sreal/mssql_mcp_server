@@ -75,8 +75,6 @@ MSSQL_QUERY_TIMEOUT=300         # Query timeout in seconds (default: 300). Queri
 MSSQL_ALLOW_WRITES=1            # Allow INSERT/UPDATE/DELETE; tool name becomes execute_sql (default: read-only `query` tool)
 MSSQL_COMMAND=query             # Optional override for the MCP tool name
 MSSQL_CONN_PROPERTIES="SET ANSI_NULLS ON;"  # Override the SET batch pymssql runs on connect
-MSSQL_RESTART_COMMAND="claude --resume <id>"  # How the user restarts their client; shown in the read-only hint (default: claude --continue)
-MSSQL_RESTART_DIR=/path/to/project         # Optional: hint starts with "cd <dir> &&" (resuming needs the session's directory)
 ```
 
 ### Azure Synapse
@@ -124,7 +122,7 @@ Results are returned as CSV; values containing commas, quotes or newlines are do
 By default the server exposes a **`query`** tool that only accepts a **single** read-only `SELECT` / `WITH` / set-operation statement (parsed as T-SQL) and sets `readOnlyHint` (so Cursor Ask mode can use it). Stacked batches (`SELECT …; INSERT …`), `SELECT INTO`, `EXEC`, and other non-SELECT statements are rejected **before** they reach the database driver.
 
 When a write is refused, nothing is run and the error says how to enable writes, for example
-`MSSQL_SYNAPSE_ALLOW_WRITES=1 claude --continue`, with a warning that writes hit the live database.
+`MSSQL_SYNAPSE_ALLOW_WRITES=1 claude`, with a warning that writes hit the live database.
 The read-only tool description carries the same hint, so the assistant can tell the user what to do.
 The write switch is read from the environment, so it takes effect only when the client restarts.
 

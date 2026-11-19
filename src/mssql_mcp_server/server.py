@@ -5,7 +5,6 @@ import io
 import logging
 import os
 import re
-import shlex
 from typing import Any
 
 import pymssql
@@ -399,18 +398,11 @@ LIVE_DATABASE_WARNING = (
 )
 
 def write_enable_command(target: str | None = None) -> str:
-    """The shell command that restarts the client with writes allowed on target (all if None).
+    """The shell command that starts Claude with writes allowed on target (all if None).
 
-    MSSQL_RESTART_COMMAND is how the user starts their MCP client (default: "claude --continue").
-    The write switch is read from the environment, so it only changes when the client restarts.
-    MSSQL_RESTART_DIR, when set, is prepended as "cd <dir> &&" (resuming a session needs its directory).
+    The write switch is read from the environment, so it only changes when Claude restarts.
     """
-    restart = os.getenv("MSSQL_RESTART_COMMAND", "").strip() or "claude --continue"
-    command = f"{_env_prefix(target)}ALLOW_WRITES=1 {restart}"
-    restart_dir = os.getenv("MSSQL_RESTART_DIR", "").strip()
-    if restart_dir:
-        command = f"cd {shlex.quote(restart_dir)} && {command}"
-    return command
+    return f"{_env_prefix(target)}ALLOW_WRITES=1 claude"
 
 def write_enable_hint(target: str | None = None) -> str:
     """Tell the user how to allow writes; used when a server is read-only."""

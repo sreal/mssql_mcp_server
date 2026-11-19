@@ -163,30 +163,30 @@ async def test_resources_are_empty_in_multi_target_mode():
 
 @pytest.mark.asyncio
 async def test_read_only_tool_description_says_how_to_enable_writes():
-    env = {**TWO_TARGETS, "MSSQL_RESTART_COMMAND": "cw --continue"}
+    env = TWO_TARGETS
     with patch.dict(os.environ, env, clear=True):
         tool = (await list_tools())[0]
     assert "Read-only (SELECT only) on: alpha, beta." in tool.description
-    assert "`MSSQL_<SERVER>_ALLOW_WRITES=1 cw --continue`" in tool.description
+    assert "`MSSQL_<SERVER>_ALLOW_WRITES=1 claude`" in tool.description
     assert "MSSQL_ALLOW_WRITES=1 instead allows writes on every server" in tool.description
 
 
 @pytest.mark.asyncio
 async def test_blocked_write_names_the_command_and_warns():
-    env = {**TWO_TARGETS, "MSSQL_RESTART_COMMAND": "cw --continue"}
+    env = TWO_TARGETS
     with patch.dict(os.environ, env, clear=True), \
          patch("mssql_mcp_server.server.pymssql.connect") as connect:
         result = await call_tool("query", {"server": "beta", "query": "UPDATE dbo.t SET x = 1"})
     connect.assert_not_called()
     text = result[0].text
     assert text.startswith("Error: beta is in read-only mode: only SELECT queries are allowed. Nothing was run.")
-    assert "`MSSQL_BETA_ALLOW_WRITES=1 cw --continue`" in text
+    assert "`MSSQL_BETA_ALLOW_WRITES=1 claude`" in text
     assert "live database" in text
 
 
 @pytest.mark.asyncio
 async def test_blocked_write_asks_claude_to_show_the_command_on_its_own_line():
-    env = {**TWO_TARGETS, "MSSQL_RESTART_COMMAND": "cw --continue"}
+    env = TWO_TARGETS
     with patch.dict(os.environ, env, clear=True), \
          patch("mssql_mcp_server.server.pymssql.connect"):
         result = await call_tool("query", {"server": "beta", "query": "UPDATE dbo.t SET x = 1"})
@@ -195,18 +195,11 @@ async def test_blocked_write_asks_claude_to_show_the_command_on_its_own_line():
         "Writes are off on beta. Show the user this command exactly, on its own line, "
         "and ask them to run it if they want writes:"
     )
-    assert lines[1] == "`MSSQL_BETA_ALLOW_WRITES=1 cw --continue`"
+    assert lines[1] == "`MSSQL_BETA_ALLOW_WRITES=1 claude`"
     assert lines[2].startswith("Writes run against the live database")
 
 
-def test_restart_command_defaults_to_claude_continue():
+def test_restart_command_is_plain_claude():
     with patch.dict(os.environ, TWO_TARGETS, clear=True):
-        assert write_enable_command("beta") == "MSSQL_BETA_ALLOW_WRITES=1 claude --continue"
-        assert write_enable_command() == "MSSQL_ALLOW_WRITES=1 claude --continue"
-
-
-def test_restart_dir_and_session_are_part_of_the_command():
-    env = {**TWO_TARGETS, "MSSQL_RESTART_COMMAND": "cw --resume abc-123", "MSSQL_RESTART_DIR": "/work/my project"}
-    with patch.dict(os.environ, env, clear=True):
-        assert write_enable_command("beta") == \
-            "cd '/work/my project' && MSSQL_BETA_ALLOW_WRITES=1 cw --resume abc-123"
+        assert write_enable_command("beta") == "MSSQL_BETA_ALLOW_WRITES=1 claude"
+        assert write_enable_command() == "MSSQL_ALLOW_WRITES=1 claude"
