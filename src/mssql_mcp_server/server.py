@@ -394,7 +394,8 @@ async def read_resource(uri: AnyUrl) -> str:
 
 LIVE_DATABASE_WARNING = (
     "Writes run against the live database: show the user the exact statement and get "
-    "their confirmation before running it."
+    "their confirmation before running it. Each statement commits as it runs, as in sqlcmd: "
+    "wrap a write that must be all-or-nothing in BEGIN TRANSACTION ... COMMIT TRANSACTION."
 )
 
 def write_enable_command(target: str | None = None) -> str:
@@ -530,7 +531,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     conn = None
     cursor = None
     try:
-        conn = pymssql.connect(**config)
+        # autocommit=True runs the query like sqlcmd and SSMS do. With autocommit off, pymssql
+        # opens a transaction on connect, and Synapse refuses CREATE TABLE AS inside one (111212).
+        # A write that must be all-or-nothing wraps itself in BEGIN TRANSACTION ... COMMIT.
+        conn = pymssql.connect(**config, autocommit=True)
         cursor = conn.cursor()
         cursor.execute(query)
         
@@ -557,7 +561,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     last_rows = cursor.fetchall()
                 if cursor.nextset() is not True:
                     break
-            conn.commit()
             text = f"Query executed successfully. Rows affected: {affected_rows}"
             if last_columns is not None:
                 text += "\n" + format_rows(last_columns, last_rows)

@@ -222,7 +222,8 @@ class TestCallToolReadOnlyGate:
             assert text.startswith("Query executed successfully. Rows affected: 85")
             assert text.endswith("check,result\nP1,PASS\nP2,FAIL")
             assert "n\n1" not in text
-            mock_conn.commit.assert_called_once()
+            assert mock_connect.call_args.kwargs["autocommit"] is True
+            mock_conn.commit.assert_not_called()
 
     async def test_write_mode_without_a_result_set_returns_only_the_count(self):
         env = {
@@ -245,4 +246,5 @@ class TestCallToolReadOnlyGate:
 
             result = await call_tool("execute_sql", {"query": "DELETE FROM t WHERE id < 4"})
             assert result[0].text == "Query executed successfully. Rows affected: 3"
-            mock_conn.commit.assert_called_once()
+            assert mock_connect.call_args.kwargs["autocommit"] is True
+            mock_conn.commit.assert_not_called()

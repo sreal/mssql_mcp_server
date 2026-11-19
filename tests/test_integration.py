@@ -127,14 +127,14 @@ class TestDatabaseIntegration:
     
     @pytest.mark.asyncio
     async def test_transaction_handling(self):
-        """Test proper transaction handling for write operations."""
+        """Writes run with autocommit, like sqlcmd; the MCP opens no transaction of its own."""
         mock_conn = Mock()
         mock_cursor = Mock()
         mock_conn.cursor.return_value = mock_cursor
         mock_cursor.rowcount = 1
         
         with (
-            patch('pymssql.connect', return_value=mock_conn),
+            patch('pymssql.connect', return_value=mock_conn) as mock_connect,
             patch.dict('os.environ', {
                 'MSSQL_USER': 'test',
                 'MSSQL_PASSWORD': 'test',
@@ -146,8 +146,8 @@ class TestDatabaseIntegration:
                 "query": "INSERT INTO users (name) VALUES ('test')"
             })
                 
-            # Verify commit was called
-            mock_conn.commit.assert_called_once()
+            assert mock_connect.call_args.kwargs["autocommit"] is True
+            mock_conn.commit.assert_not_called()
             assert "Rows affected: 1" in result[0].text
     
     @pytest.mark.asyncio
